@@ -902,6 +902,57 @@ describe("LCM integration: compaction", () => {
     expect(contextItems.length).toBeLessThan(10);
   });
 
+  it("compactFullSweep condenses accumulated leaves under threshold once fanout is reached (issue #29)", async () => {
+    // Regression for #29: non-force compactFullSweep used to early-return (and
+    // skip Phase 2) once stored tokens were under threshold, so depth-0 leaves
+    // accumulated unbounded and condensation never ran — leading to context
+    // overflow death-spirals. Condensation must be fanout-driven: once
+    // leafMinFanout same-depth leaves pile up, condense them regardless of the
+    // token threshold.
+    const engine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafChunkTokens: 500,
+      condensedTargetTokens: 10,
+    });
+
+    await convStore.createConversation({ sessionId: "issue-29-condense-under-threshold" });
+
+    // 8 depth-0 leaves (== leafMinFanout) already in context, 60 tokens each.
+    // Total 480 tokens stays far below threshold (0.75 * 10000 = 7500), so the
+    // token gate alone would skip condensation — but the fanout is met.
+    for (let i = 0; i < 8; i++) {
+      const id = `sum_issue29_leaf_${i}`;
+      await sumStore.insertSummary({
+        summaryId: id,
+        conversationId: CONV_ID,
+        kind: "leaf",
+        depth: 0,
+        content: `Issue 29 accumulated leaf ${i}`,
+        tokenCount: 60,
+      });
+      await sumStore.appendContextSummary(CONV_ID, id);
+    }
+    // No raw messages: leaf trigger is inactive and Phase 1 has nothing to do.
+
+    const summarize = vi.fn(
+      async (_text: string, _aggressive?: boolean, options?: { isCondensed?: boolean }) =>
+        options?.isCondensed ? "Condensed summary of accumulated leaves" : "Leaf summary",
+    );
+
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000, // threshold 7500, far above the 480 stored tokens
+      summarize,
+      force: false, // the crux: non-force must still condense by fanout
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.condensed).toBe(true);
+    const condensedSummaries = sumStore._summaries.filter((s) => s.kind === "condensed");
+    expect(condensedSummaries.length).toBeGreaterThanOrEqual(1);
+  });
+
   it("compactLeaf uses preceding summary context for soft leaf continuity", async () => {
     const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,

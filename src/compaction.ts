@@ -388,7 +388,23 @@ export class CompactionEngine {
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
     const leafTrigger = await this.evaluateLeafTrigger(conversationId);
 
-    if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
+    // Condensed maintenance is fanout-driven, not only threshold-driven. Even when
+    // stored tokens are already under threshold, accumulated same-depth summaries
+    // (>= fanout) must still be condensed; otherwise leaf summaries pile up
+    // unbounded whenever the soft leaf pass keeps stored tokens under threshold
+    // (issue #29). Probe for a condensation candidate before the early return.
+    const hasCondensationCandidate =
+      (await this.selectShallowestCondensationCandidate({
+        conversationId,
+        hardTrigger: hardTrigger === true,
+      })) !== null;
+
+    if (
+      !force &&
+      tokensBefore <= threshold &&
+      !leafTrigger.shouldCompact &&
+      !hasCondensationCandidate
+    ) {
       return {
         actionTaken: false,
         tokensBefore,
@@ -458,7 +474,11 @@ export class CompactionEngine {
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
-    while (force || previousTokens > threshold) {
+    // Candidate-driven, not threshold-driven: keep condensing while same-depth
+    // summaries have accumulated to fanout, even if stored tokens are already under
+    // threshold. The `!candidate` break (fanout not yet reached) and the no-progress
+    // guard below bound the loop (issue #29).
+    while (true) {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
         hardTrigger: hardTrigger === true,
@@ -493,10 +513,10 @@ export class CompactionEngine {
       createdSummaryId = condenseResult.summaryId;
       level = condenseResult.level;
 
-      if (!force && passTokensAfter <= threshold) {
-        previousTokens = passTokensAfter;
-        break;
-      }
+      // No early threshold break here: once condensing, keep draining the fanout
+      // backlog until no candidate remains (loop top) or no progress is made
+      // (guard below). Stopping at threshold is what starved condensation and let
+      // leaf summaries pile up (issue #29).
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
