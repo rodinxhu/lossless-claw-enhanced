@@ -444,15 +444,38 @@ export function blockFromPart(part: MessagePartRecord): unknown {
     return { type: "text", text: part.textContent ?? "" };
   }
 
+  // Image/file parts: reconstruct the original image block from metadata.raw,
+  // or fall back to a lightweight placeholder. Never dump raw metadata as text —
+  // it contains the full base64 payload and would blow up the context window.
+  if (part.partType === "file" || metadata.rawType === "image") {
+    const raw = metadata.raw as Record<string, unknown> | undefined;
+    if (raw && raw.type === "image" && typeof raw.data === "string" && raw.data.length > 200) {
+      // Reconstruct the original image block for vision-capable models.
+      return { type: "image", data: raw.data, mimeType: raw.mimeType ?? "image/jpeg" };
+    }
+    // No usable image data (already stripped or missing) — emit a text placeholder.
+    const mimeHint = (raw?.mimeType as string | undefined) ?? "image";
+    const contentHint = typeof part.textContent === "string" && part.textContent.length > 0
+      ? part.textContent
+      : "[image attachment]";
+    return { type: "text", text: `[${mimeHint}: ${contentHint}]` };
+  }
+
   if (typeof part.textContent === "string" && part.textContent.length > 0) {
     return { type: "text", text: part.textContent };
   }
 
   const decodedFallback = parseJson(part.metadata);
   if (decodedFallback && typeof decodedFallback === "object") {
+    // Strip any large binary fields before serializing to avoid context bloat.
+    const safe = { ...(decodedFallback as Record<string, unknown>) };
+    const raw = safe.raw as Record<string, unknown> | undefined;
+    if (raw && typeof raw.data === "string" && raw.data.length > 200) {
+      safe.raw = { ...raw, data: "[binary data removed]" };
+    }
     return {
       type: "text",
-      text: JSON.stringify(decodedFallback),
+      text: JSON.stringify(safe),
     };
   }
   return { type: "text", text: "" };

@@ -56,7 +56,7 @@ When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
 1. **bootstrap** — On session start, reconciles the JSONL session file with the LCM database. Imports any messages that exist in the file but not in LCM (crash recovery).
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
-3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether compaction should run.
+3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether compaction should run. Ingestion and compaction are independent: a turn whose `dedupedNewMessages` is empty (e.g., gateway-restart replay where every message is already in the DB) still falls through to compact-evaluation, because the live runtime transcript may be over threshold even when nothing new needs to be persisted. Compaction is only skipped if `ingestBatch` itself errored (which would leave the LCM frontier stale).
 
 ### Leaf compaction
 
@@ -212,6 +212,16 @@ This handles the case where OpenClaw wrote messages to the session file but cras
 ## Operation serialization
 
 All mutating operations (ingest, compact) are serialized per-session using a promise queue. This prevents races between concurrent afterTurn/compact calls for the same conversation without blocking operations on different conversations.
+
+## Diagnostics
+
+Three `console.warn` lines tagged `[lcm-debug]` are emitted in the compaction path so trigger regressions are visible in `journalctl --user -u openclaw-gateway` without needing source instrumentation:
+
+- `[lcm-debug] afterTurn entry` — emitted on every `afterTurn` call before leaf-trigger and compact evaluation. Fields: `sessionKey`, `sessionId`, `messages` count, `liveContextTokens`, `tokenBudget`.
+- `[lcm-debug] compact lookup` — emitted on every `compact` call, indicating whether `conversationStore.getConversationForSession` resolved a conversation. A `conversationFound=NO` here is the silent exit `"no conversation found for session"`.
+- `[lcm-debug] decision` — emitted after `compaction.evaluate`. Fields: `observedTokens`, `tokenBudget`, `currentTokens`, `threshold`, `shouldCompact`, `reason`, `forceCompaction`. A `shouldCompact=false` with high `currentTokens` indicates the threshold or budget is mis-resolved.
+
+If you don't see these three lines for a turn, `afterTurn` is being short-circuited before reaching them — check the early-return at session-ignore/stateless-session/ingest-failure.
 
 ## Authentication
 

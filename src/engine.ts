@@ -120,6 +120,17 @@ const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
   "tool_use_result",
 ]);
 
+const IMAGE_BINARY_FIELD_NAMES: ReadonlyArray<string> = [
+  "data",
+  "image_data",
+  "imageData",
+  "image_base64",
+  "imageBase64",
+  "b64_json",
+  "bytes",
+  "payload",
+];
+
 function looksLikeJsonPayload(value: string): boolean {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -440,6 +451,39 @@ function estimateContentTokensForRole(params: {
   return estimateTokens(fallbackContent);
 }
 
+function sanitizeRawPartValue(rawType: string, rawValue: unknown): unknown {
+  if (!rawValue || typeof rawValue !== "object" || Array.isArray(rawValue)) {
+    return rawValue;
+  }
+
+  if (rawType !== "image") {
+    return rawValue;
+  }
+
+  const record = rawValue as Record<string, unknown>;
+  const sanitized: Record<string, unknown> = { ...record };
+  let stripped = false;
+
+  for (const field of IMAGE_BINARY_FIELD_NAMES) {
+    if (typeof sanitized[field] === "string" && sanitized[field]) {
+      const base64Value = sanitized[field] as string;
+      delete sanitized[field];
+      stripped = true;
+      try {
+        sanitized["rawDataByteLength"] = Buffer.from(base64Value, "base64").byteLength;
+      } catch {
+        sanitized["rawDataByteLength"] = base64Value.length;
+      }
+    }
+  }
+
+  if (stripped) {
+    sanitized["rawDataStripped"] = true;
+  }
+
+  return sanitized;
+}
+
 function buildMessageParts(params: {
   sessionId: string;
   message: AgentMessage;
@@ -541,6 +585,8 @@ function buildMessageParts(params: {
       safeString(metadataRecord?.call_id) ??
       (partType === "tool" ? safeString(metadataRecord?.id) : undefined) ??
       topLevelToolCallId;
+    const rawValue = metadataRecord ?? message.content[ordinal];
+    const sanitizedRaw = sanitizeRawPartValue(block.type, rawValue);
 
     parts.push({
       sessionId,
@@ -580,7 +626,7 @@ function buildMessageParts(params: {
         toolOutputExternalized: safeBoolean(metadataRecord?.toolOutputExternalized),
         externalizationReason: safeString(metadataRecord?.externalizationReason),
         rawType: block.type,
-        raw: metadataRecord ?? message.content[ordinal],
+        raw: sanitizedRaw,
       }),
     });
   }
@@ -2302,25 +2348,27 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     ingestBatch.push(...dedupedNewMessages);
-    if (ingestBatch.length === 0) {
-      return;
+    if (ingestBatch.length > 0) {
+      try {
+        await this.ingestBatch({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          messages: ingestBatch,
+          isHeartbeat: params.isHeartbeat === true,
+        });
+      } catch (err) {
+        // Never compact a stale or partially ingested frontier.
+        console.error(
+          `[lcm] afterTurn: ingest failed, skipping compaction:`,
+          err instanceof Error ? err.message : err,
+        );
+        return;
+      }
     }
-
-    try {
-      await this.ingestBatch({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        messages: ingestBatch,
-        isHeartbeat: params.isHeartbeat === true,
-      });
-    } catch (err) {
-      // Never compact a stale or partially ingested frontier.
-      console.error(
-        `[lcm] afterTurn: ingest failed, skipping compaction:`,
-        err instanceof Error ? err.message : err,
-      );
-      return;
-    }
+    // NOTE: Empty ingestBatch (all-duplicates after a gateway-restart replay,
+    // or a turn with no new messages) intentionally falls through to compaction.
+    // The live transcript may still be over threshold even when nothing new
+    // needs to be ingested, and a stale runtime is what caused the original bug.
 
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
     const DEFAULT_AFTER_TURN_TOKEN_BUDGET = 128_000;
@@ -2337,6 +2385,10 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+    console.warn(
+      `[lcm-debug] afterTurn entry sessionKey=${params.sessionKey} sessionId=${params.sessionId} ` +
+        `messages=${params.messages.length} liveContextTokens=${liveContextTokens} tokenBudget=${tokenBudget}`,
+    );
 
     try {
       const leafTrigger = await this.evaluateLeafTrigger(params.sessionId, params.sessionKey);
@@ -2615,6 +2667,10 @@ export class LcmContextEngine implements ContextEngine {
           sessionId,
           sessionKey: params.sessionKey,
         });
+        console.warn(
+          `[lcm-debug] compact lookup sessionKey=${params.sessionKey} sessionId=${sessionId} ` +
+            `conversationFound=${conversation ? "yes(id=" + conversation.conversationId + ")" : "NO"}`,
+        );
         if (!conversation) {
           return {
             ok: true,
@@ -2665,6 +2721,13 @@ export class LcmContextEngine implements ContextEngine {
         observedTokens !== undefined
           ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
           : await this.compaction.evaluate(conversationId, tokenBudget);
+      console.warn(
+        `[lcm-debug] decision sessionKey=${params.sessionKey} conversationId=${conversationId} ` +
+          `observedTokens=${observedTokens ?? "undefined"} tokenBudget=${tokenBudget} ` +
+          `currentTokens=${decision.currentTokens} threshold=${decision.threshold} ` +
+          `shouldCompact=${decision.shouldCompact} reason=${decision.reason} ` +
+          `forceCompaction=${forceCompaction}`,
+      );
       const targetTokens =
         params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
       const liveContextStillExceedsTarget =

@@ -1,5 +1,12 @@
 # @martian-engineering/lossless-claw
 
+## Unreleased
+
+### Patch Changes
+
+- Decouple compaction from ingestion in `engine.ts` `afterTurn`. Previously, when `dedupedNewMessages` was empty (e.g., after a gateway-restart replay where every replayed message was detected as a duplicate), `afterTurn` returned silently before evaluating compaction — letting the live transcript grow past the context window with no log line. The empty-batch case now falls through to the compact-evaluation path while ingest *failure* still skips compact (preserving the "never compact a stale frontier" guarantee). Symptom: Telegram main session reached 496k input tokens against a 400k budget and the model rejected the prompt; no LCM compaction events appeared in journalctl despite the threshold being far exceeded.
+- Add `[lcm-debug]` `console.warn` lines at the three previously silent decision points in `engine.ts` (`afterTurn` entry, conversation lookup in `compact`, and the `evaluate` decision) so future trigger regressions are visible in journalctl without needing source instrumentation.
+
 ## 0.5.3
 
 ### Patch Changes
